@@ -1,14 +1,79 @@
 # app.py
 
+# --- Compatibility & startup-hardening shim -----------------------------------
+from __future__ import annotations
+import warnings
+
+# Silence *known* library deprecations that spam logs (not failures).
+warnings.filterwarnings(
+    "ignore",
+    message="The default of observed=False is deprecated and will be changed to True",
+    category=FutureWarning,
+)
+
+import streamlit as st  # noqa: E402
+
+def _translate_width(kwargs: dict) -> dict:
+    """Translate deprecated use_container_width -> width='stretch'/'content'."""
+    if "use_container_width" in kwargs:
+        val = kwargs.pop("use_container_width")
+        kwargs.setdefault("width", "stretch" if val else "content")
+    return kwargs
+
+def _wrap_st_fn(fn):
+    def _inner(*args, **kwargs):
+        return fn(*args, **_translate_width(kwargs))
+    _inner.__name__ = fn.__name__
+    return _inner
+
+# Patch common renderers so legacy code & libs won't warn
+for _name in [
+    "plotly_chart","dataframe","table","altair_chart","pydeck_chart",
+    "map","line_chart","bar_chart","area_chart","pyplot",
+]:
+    if hasattr(st, _name):
+        setattr(st, _name, _wrap_st_fn(getattr(st, _name)))
+
+# Pandas groupby: keep legacy default & silence FutureWarning without changing behavior
+import pandas as pd  # noqa: E402
+_pd_df_groupby_orig = pd.DataFrame.groupby
+def _pd_groupby_compat(self, *args, **kwargs):
+    kwargs.setdefault("observed", False)
+    return _pd_df_groupby_orig(self, *args, **kwargs)
+pd.DataFrame.groupby = _pd_groupby_compat  # type: ignore[assignment]
+
+# Lazy import helpers (avoid slow startup / health-check 503s)
+def lazy_import(name: str):
+    import importlib
+    try:
+        return importlib.import_module(name)
+    except Exception as e:  # never block app start
+        return e
+
+def ensure_shap():
+    mod = lazy_import("shap")
+    if isinstance(mod, Exception):
+        st.info("SHAP not available in this environment. Skipping SHAP visuals.")
+        return None
+    return mod
+
+def ensure_prophet():
+    mod = lazy_import("prophet")
+    if isinstance(mod, Exception):
+        st.info("Prophet not available. Falling back to ARIMA for forecasting.")
+        return None
+    return mod
+
+# Page config early to avoid re-render churn
+st.set_page_config(page_title="Uber NCR 2024 – Analytics & Decision Lab", page_icon="🚖", layout="wide")
+# --- End shim -----------------------------------------------------------------
+
+
 import os
 import io
-import warnings
 from typing import Tuple, List, Optional
 
 import numpy as np
-import pandas as pd
-
-import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import matplotlib.pyplot as plt
@@ -27,39 +92,17 @@ from sklearn.mixture import GaussianMixture
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, IsolationForest, GradientBoostingRegressor
 from sklearn.linear_model import LogisticRegression, LinearRegression
 
-# Optional libs
+# Optional heavy libs (OK if missing)
 try:
     import xgboost as xgb
 except Exception:
     xgb = None
-
 try:
     import lightgbm as lgb
 except Exception:
     lgb = None
 
-try:
-    import shap
-except Exception:
-    shap = None
-
-try:
-    from prophet import Prophet
-except Exception:
-    Prophet = None
-
 import statsmodels.api as sm
-from statsmodels.tsa.seasonal import seasonal_decompose
-
-# ------------------------------#
-# Page Settings
-# ------------------------------#
-st.set_page_config(
-    page_title="Uber NCR 2024 – Analytics & Decision Lab",
-    page_icon="🚖",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 # ------------------------------#
 # Constants
@@ -150,10 +193,8 @@ def preprocess(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     df = df.copy()
 
     # Parse Date and Time → timestamp
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        df["parsed_date"] = pd.to_datetime(df[DATE_COL], dayfirst=True, errors="coerce")
-        df["parsed_time"] = pd.to_datetime(df[TIME_COL], format="%H:%M:%S", errors="coerce").dt.time
+    df["parsed_date"] = pd.to_datetime(df[DATE_COL], dayfirst=True, errors="coerce")
+    df["parsed_time"] = pd.to_datetime(df[TIME_COL], format="%H:%M:%S", errors="coerce").dt.time
 
     def build_timestamp(r):
         if pd.isna(r["parsed_date"]) or pd.isna(r["parsed_time"]):
@@ -188,25 +229,22 @@ def preprocess(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     for k, v in rename_map.items():
         df[v] = safe_numeric(df[k])
 
-    # Reason fields – clean / standardize
+    # Reasons – clean / standardize
     df["reason_customer"] = df["Reason for cancelling by Customer"].map(_title_case_or_nan)
     df["reason_driver"] = df["Driver Cancellation Reason"].map(_title_case_or_nan)
     df["reason_incomplete"] = df.get("Incomplete Rides Reason", np.nan)
     df["reason_incomplete"] = df["reason_incomplete"].map(_title_case_or_nan)
 
-    # Canonical status
+    # Canonical status & target
     df["booking_status_canon"] = df.apply(canonical_status, axis=1)
+    df["will_complete"] = (df["booking_status_canon"] == "Completed").astype(int)
 
     # Categoricals
-    cat_cols = [
+    for c in [
         "Booking Status", "booking_status_canon", "Vehicle Type", "Pickup Location",
         "Drop Location", "Payment Method", "time_bucket"
-    ]
-    for c in cat_cols:
+    ]:
         df[c] = df[c].astype("category")
-
-    # Target
-    df["will_complete"] = (df["booking_status_canon"] == "Completed").astype(int)
 
     df = df.sort_values("timestamp").reset_index(drop=True)
     return df, msgs
@@ -250,8 +288,8 @@ def plot_series(df: pd.DataFrame):
     s = s.reset_index()
     fig1 = px.line(s, x="timestamp", y="bookings", title="Bookings Over Time", markers=True, color_discrete_sequence=[DEMAND_COLOR])
     fig2 = px.line(s, x="timestamp", y="revenue", title="Revenue Over Time (Completed)", markers=True, color_discrete_sequence=[FIN_COLOR])
-    st.plotly_chart(fig1, width="stretch")
-    st.plotly_chart(fig2, width="stretch")
+    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(fig2, use_container_width=True)
 
 def descriptive_stats(df: pd.DataFrame):
     cols = ["ride_distance", "booking_value", "driver_ratings", "customer_rating"]
@@ -264,13 +302,13 @@ def descriptive_stats(df: pd.DataFrame):
             "Median": np.nanmedian(s),
             "Mode": s.mode().iloc[0] if s.dropna().size > 0 else np.nan
         })
-    st.dataframe(pd.DataFrame(rows).round(2), width="stretch")
+    st.dataframe(pd.DataFrame(rows).round(2), use_container_width=True)
 
 def bar_from_series(series: pd.Series, title: str, x_label: str = None, y_label: str = "Count", color=DEMAND_COLOR):
     dfp = series.reset_index()
     dfp.columns = [x_label or series.index.name or "Category", y_label]
     fig = px.bar(dfp, x=dfp.columns[0], y=dfp.columns[1], title=title, color_discrete_sequence=[color])
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 def filter_block(df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.subheader("📅 Global Filters")
@@ -320,7 +358,7 @@ data_source = st.sidebar.radio("Choose source", ["Auto-detect file", "Upload CSV
 default_path = "ncr_ride_bookingsv1.csv"
 
 df_raw = None
-load_msgs = []
+load_msgs: List[str] = []
 try:
     if data_source == "Auto-detect file":
         if os.path.exists(default_path):
@@ -393,7 +431,7 @@ with tabs[0]:
     values = [total, completed, rated]
     fig = go.Figure(go.Funnel(y=stages, x=values, textinfo="value+percent previous"))
     fig.update_layout(height=350, margin=dict(l=20, r=20, t=10, b=10))
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
     c1, c2 = st.columns([1.2, 1])
@@ -408,7 +446,7 @@ with tabs[0]:
 
     # Insight
     spike = (
-        df_f.groupby("time_bucket", observed=False)["Booking ID"].count()
+        df_f.groupby("time_bucket")["Booking ID"].count()
         .sort_values(ascending=False)
         .head(1)
     )
@@ -449,11 +487,11 @@ with tabs[1]:
     st.markdown("---")
     st.markdown("### Cancellation Rate by Vehicle / Time Bucket / Pickup")
     by_vehicle = (df_f.assign(is_cancel=(df_f["will_complete"] == 0))
-                  .groupby("Vehicle Type", observed=False)["is_cancel"].mean().sort_values(ascending=False))
+                  .groupby("Vehicle Type")["is_cancel"].mean().sort_values(ascending=False))
     by_bucket = (df_f.assign(is_cancel=(df_f["will_complete"] == 0))
-                 .groupby("time_bucket", observed=False)["is_cancel"].mean().sort_values(ascending=False))
+                 .groupby("time_bucket")["is_cancel"].mean().sort_values(ascending=False))
     by_pickup = (df_f.assign(is_cancel=(df_f["will_complete"] == 0))
-                 .groupby("Pickup Location", observed=False)["is_cancel"].mean().sort_values(ascending=False).head(20))
+                 .groupby("Pickup Location")["is_cancel"].mean().sort_values(ascending=False).head(20))
 
     bar_from_series(by_vehicle, "Cancellation Rate by Vehicle Type", "Vehicle Type", "Rate")
     bar_from_series(by_bucket, "Cancellation Rate by Time Bucket", "Time Bucket", "Rate")
@@ -476,13 +514,13 @@ with tabs[2]:
     top_drop = df_f["Drop Location"].value_counts().head(20).rename("count").reset_index().rename(columns={"index": "Drop Location"})
     c1, c2 = st.columns(2)
     with c1:
-        st.dataframe(top_pick, width="stretch")
+        st.dataframe(top_pick, use_container_width=True)
         fig = px.bar(top_pick, x="Pickup Location", y="count", title="Top Pickups", color_discrete_sequence=[DEMAND_COLOR])
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
     with c2:
-        st.dataframe(top_drop, width="stretch")
+        st.dataframe(top_drop, use_container_width=True)
         fig = px.bar(top_drop, x="Drop Location", y="count", title="Top Drops", color_discrete_sequence=[DEMAND_COLOR])
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
     st.markdown("### Peak Patterns")
@@ -491,11 +529,11 @@ with tabs[2]:
     c3, c4 = st.columns(2)
     with c3:
         fig = px.bar(hh, title="By Hour of Day", labels={"index":"Hour","value":"Trips"}, color_discrete_sequence=[DEMAND_COLOR])
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
     with c4:
         dow_map = {0:"Mon",1:"Tue",2:"Wed",3:"Thu",4:"Fri",5:"Sat",6:"Sun"}
         fig = px.bar(dow.rename(index=dow_map), title="By Day of Week", labels={"index":"Day","value":"Trips"}, color_discrete_sequence=[DEMAND_COLOR])
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
     st.markdown("### Category Heat Tables")
@@ -504,14 +542,14 @@ with tabs[2]:
                     .pivot_table(index="Pickup Location", columns="hour", values="cnt", aggfunc="sum", fill_value=0))
     heat_pick_hr = heat_pick_hr.loc[heat_pick_hr.sum(axis=1).sort_values(ascending=False).head(20).index]
     st.plotly_chart(px.imshow(heat_pick_hr, aspect="auto", color_continuous_scale="Blues",
-                              title="Pickup × Hour Heat (Top 20 Pickups)"), width="stretch")
+                              title="Pickup × Hour Heat (Top 20 Pickups)"), use_container_width=True)
     # Pickup × Weekday heat
     heat_pick_dow = (df_f.assign(cnt=1)
                      .pivot_table(index="Pickup Location", columns="weekday", values="cnt", aggfunc="sum", fill_value=0))
     heat_pick_dow = heat_pick_dow.loc[heat_pick_dow.sum(axis=1).sort_values(ascending=False).head(20).index]
     heat_pick_dow.columns = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
     st.plotly_chart(px.imshow(heat_pick_dow, aspect="auto", color_continuous_scale="Blues",
-                              title="Pickup × Day-of-Week Heat (Top 20 Pickups)"), width="stretch")
+                              title="Pickup × Day-of-Week Heat (Top 20 Pickups)"), use_container_width=True)
 
 # ---------- Tab 4
 with tabs[3]:
@@ -521,25 +559,26 @@ with tabs[3]:
     c1, c2 = st.columns(2)
     with c1:
         fig = px.histogram(df_f, x="avg_vtat", nbins=40, title="Avg VTAT", color_discrete_sequence=[RISK_COLOR])
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
     with c2:
         fig = px.histogram(df_f, x="avg_ctat", nbins=40, title="Avg CTAT", color_discrete_sequence=[RISK_COLOR])
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
     st.markdown("### By Location & Vehicle")
-    gv = df_f.groupby(["Pickup Location","Vehicle Type"], observed=False).agg(
+    gv = df_f.groupby(["Pickup Location","Vehicle Type"]).agg(
         vt=("avg_vtat","mean"),
         ct=("avg_ctat","mean"),
         n=("Booking ID","count")
     ).reset_index().sort_values("n", ascending=False).head(30)
-    st.dataframe(gv.round(2), width="stretch")
+    st.dataframe(gv.round(2), use_container_width=True)
 
     st.markdown("---")
     st.markdown("### Correlations")
     corr_cols = ["avg_vtat","avg_ctat","driver_ratings","customer_rating","booking_value","ride_distance","will_complete"]
     cmat = df_f[corr_cols].replace(0, np.nan).corr()
-    st.plotly_chart(px.imshow(cmat, text_auto=True, aspect="auto", color_continuous_scale="RdBu_r", title="Correlation Matrix"), width="stretch")
+    st.plotly_chart(px.imshow(cmat, text_auto=True, aspect="auto", color_continuous_scale="RdBu_r",
+                              title="Correlation Matrix"), use_container_width=True)
 
     vt_min = float(np.nanmin(df_f["avg_vtat"])) if df_f["avg_vtat"].notna().any() else 0.0
     vt_max = float(np.nanmax(df_f["avg_vtat"])) if df_f["avg_vtat"].notna().any() else 1.0
@@ -566,16 +605,16 @@ with tabs[4]:
 
     st.markdown("---")
     st.markdown("### Revenue by Payment Method & Vehicle")
-    grp = df_f[rev_mask].groupby(["Payment Method", "Vehicle Type"], observed=False)["booking_value"].sum().reset_index()
+    grp = df_f[rev_mask].groupby(["Payment Method", "Vehicle Type"])["booking_value"].sum().reset_index()
     fig = px.bar(grp, x="Payment Method", y="booking_value", color="Vehicle Type", barmode="stack",
                  title="Revenue Mix", color_discrete_sequence=px.colors.qualitative.Set2)
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
     st.markdown("### Value vs Distance")
     fig2 = px.scatter(df_f[rev_mask], x="ride_distance", y="booking_value", color="Vehicle Type",
                       trendline="ols", title="Booking Value vs Ride Distance")
-    st.plotly_chart(fig2, width="stretch")
+    st.plotly_chart(fig2, use_container_width=True)
 
 # ---------- Tab 6
 with tabs[5]:
@@ -584,23 +623,23 @@ with tabs[5]:
     c1, c2 = st.columns(2)
     with c1:
         st.plotly_chart(px.histogram(df_f, x="driver_ratings", nbins=20, title="Driver Ratings",
-                                     color_discrete_sequence=[CX_COLOR]), width="stretch")
+                                     color_discrete_sequence=[CX_COLOR]), use_container_width=True)
     with c2:
         st.plotly_chart(px.histogram(df_f, x="customer_rating", nbins=20, title="Customer Ratings",
-                                     color_discrete_sequence=[CX_COLOR]), width="stretch")
+                                     color_discrete_sequence=[CX_COLOR]), use_container_width=True)
 
     st.markdown("---")
     st.markdown("### Correlations & Risk Flags")
     r1 = df_f[["driver_ratings","avg_vtat","cancelled_by_driver"]].corr().iloc[0,1:].to_frame("corr")
     st.write("**Driver Ratings vs VTAT & Driver Cancellations**")
-    st.dataframe(r1.round(2), width="stretch")
+    st.dataframe(r1.round(2), use_container_width=True)
 
     low_thr = st.slider("Low rating threshold", 1.0, 5.0, 3.5, 0.1)
     seg = (df_f.assign(low_rate = (df_f["customer_rating"] > 0) & (df_f["customer_rating"] < low_thr))
-           .groupby(["Vehicle Type","time_bucket"], observed=False)["low_rate"].mean().reset_index()
+           .groupby(["Vehicle Type","time_bucket"])["low_rate"].mean().reset_index()
            .sort_values("low_rate", ascending=False).head(20))
     st.plotly_chart(px.bar(seg, x="low_rate", y="Vehicle Type", color="time_bucket", orientation="h",
-                           title=f"Probability of < {low_thr:.1f} Stars by Segment"), width="stretch")
+                           title=f"Probability of < {low_thr:.1f} Stars by Segment"), use_container_width=True)
 
 # ---------- Tab 7
 with tabs[6]:
@@ -679,7 +718,7 @@ def plot_confusion(y_true, y_pred):
     fig = px.imshow(cm, text_auto=True, color_continuous_scale="Blues", title="Confusion Matrix")
     fig.update_xaxes(title="Predicted")
     fig.update_yaxes(title="Actual")
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 def plot_roc(y_true, y_score):
     fpr, tpr, _ = roc_curve(y_true, y_score)
@@ -691,12 +730,14 @@ def plot_roc(y_true, y_score):
     ax.set_ylabel("True Positive Rate")
     ax.set_title("ROC Curve")
     ax.legend()
-    st.pyplot(fig)
+    st.pyplot(fig, use_container_width=True)
 
-def train_forecast(df_ts: pd.DataFrame, model_name: str, periods: int = 14) -> Tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+def train_forecast(df_ts: pd.DataFrame, model_name: str, periods: int = 14):
     """Return (history_df, forecast_df). df_ts must have columns ['ds','y'] (daily)."""
+    # Standardize on daily cadence for robustness
     y = df_ts.set_index("ds")["y"].asfreq("D").fillna(0)
-    if model_name == "Prophet" and Prophet is not None:
+    if model_name == "Prophet" and ensure_prophet() is not None:
+        Prophet = ensure_prophet().Prophet  # type: ignore[attr-defined]
         m = Prophet(seasonality_mode="additive")
         m.fit(pd.DataFrame({"ds": y.index, "y": y.values}))
         future = m.make_future_dataframe(periods=periods, freq="D")
@@ -768,7 +809,6 @@ with tabs[7]:
     except Exception:
         pass
 
-    # Feature importance / coefficients
     st.markdown("#### Feature Importance / Coefficients")
     try:
         model = pipe.named_steps["clf"]
@@ -781,18 +821,19 @@ with tabs[7]:
         if hasattr(model, "feature_importances_"):
             fi = model.feature_importances_
             imp_df = pd.DataFrame({"feature": feature_names, "importance": fi}).sort_values("importance", ascending=False).head(25)
-            st.plotly_chart(px.bar(imp_df, x="importance", y="feature", orientation="h", title="Top Features"), width="stretch")
+            st.plotly_chart(px.bar(imp_df, x="importance", y="feature", orientation="h", title="Top Features"), use_container_width=True)
         elif hasattr(model, "coef_"):
             coefs = model.coef_.ravel()
             coef_df = pd.DataFrame({"feature": feature_names, "coef": coefs}).assign(abs_coef=lambda d: d["coef"].abs()).sort_values("abs_coef", ascending=False).head(25)
-            st.plotly_chart(px.bar(coef_df, x="coef", y="feature", orientation="h", title="Top Coefficients"), width="stretch")
+            st.plotly_chart(px.bar(coef_df, x="coef", y="feature", orientation="h", title="Top Coefficients"), use_container_width=True)
         else:
             st.info("Model does not expose importances/coefficients.")
     except Exception as e:
         st.info(f"Feature importance unavailable: {e}")
 
     # Optional SHAP (sampled)
-    if shap is not None and hasattr(pipe.named_steps["clf"], "predict"):
+    shap_mod = ensure_shap()
+    if shap_mod is not None and hasattr(pipe.named_steps["clf"], "predict"):
         with st.expander("SHAP (sampled)"):
             sample_n = min(10000, len(X_test))
             if sample_n >= 100:
@@ -800,13 +841,18 @@ with tabs[7]:
                 try:
                     X_enc = pipe.named_steps["pre"].fit_transform(X_train)
                     model = pipe.named_steps["clf"]
-                    explainer = shap.Explainer(model, X_enc, feature_names=feature_names)
+                    explainer = shap_mod.Explainer(model, X_enc)  # type: ignore[attr-defined]
                     vals = explainer(pipe.named_steps["pre"].transform(Xs))
                     st.write("Mean |SHAP| (top 20)")
                     shap_sum = np.abs(vals.values).mean(axis=0)
                     top_idx = np.argsort(shap_sum)[::-1][:20]
+                    # Recompute names in case fitting transformed columns changed
+                    oh: OneHotEncoder = pipe.named_steps["pre"].named_transformers_["cat"]
+                    num_cols = pipe.named_steps["pre"].transformers_[0][2]
+                    cat_cols = pipe.named_steps["pre"].transformers_[1][2]
+                    feature_names = list(num_cols) + list(oh.get_feature_names_out(cat_cols))
                     fidf = pd.DataFrame({"feature":[feature_names[i] for i in top_idx], "mean_abs_shap": shap_sum[top_idx]})
-                    st.plotly_chart(px.bar(fidf, x="mean_abs_shap", y="feature", orientation="h"), width="stretch")
+                    st.plotly_chart(px.bar(fidf, x="mean_abs_shap", y="feature", orientation="h"), use_container_width=True)
                 except Exception as e:
                     st.info(f"SHAP failed: {e}")
             else:
@@ -824,22 +870,24 @@ with tabs[7]:
     periods = st.slider("Forecast Horizon (days)", 7, 60, 14)
     hist, fc = train_forecast(ts, fcast_choice, periods=periods)
 
-    if fcast_choice == "Prophet" and Prophet is not None and fc is not None:
+    if fcast_choice == "Prophet" and ensure_prophet() is not None and fc is not None:
         fig = px.line(fc, x="ds", y="yhat", title="Forecast", color_discrete_sequence=[DEMAND_COLOR])
         if "yhat_lower" in fc.columns:
             fig.add_traces([
                 go.Scatter(x=fc["ds"], y=fc["yhat_upper"], line=dict(width=0), showlegend=False),
-                go.Scatter(x=fc["ds"], y=fc["yhat_lower"], line=dict(width=0), fill="tonexty", fillcolor="rgba(31,119,180,0.2)", showlegend=False)
+                go.Scatter(x=fc["ds"], y=fc["yhat_lower"], line=dict(width=0), fill="tonexty",
+                           fillcolor="rgba(31,119,180,0.2)", showlegend=False)
             ])
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
     elif fc is not None:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=hist["ds"], y=hist["yhat"], name="History"))
         fig.add_trace(go.Scatter(x=fc["ds"], y=fc["yhat"], name="Forecast"))
         if "yhat_lower" in fc.columns:
             fig.add_trace(go.Scatter(x=fc["ds"], y=fc["yhat_upper"], line=dict(width=0), showlegend=False))
-            fig.add_trace(go.Scatter(x=fc["ds"], y=fc["yhat_lower"], line=dict(width=0), fill="tonexty", fillcolor="rgba(31,119,180,0.2)", showlegend=False))
-        st.plotly_chart(fig, width="stretch")
+            fig.add_trace(go.Scatter(x=fc["ds"], y=fc["yhat_lower"], line=dict(width=0), fill="tonexty",
+                                     fillcolor="rgba(31,119,180,0.2)", showlegend=False))
+        st.plotly_chart(fig, use_container_width=True)
     else:
         st.info("No forecast generated.")
 
@@ -893,7 +941,7 @@ with tabs[7]:
     pca = PCA(n_components=2, random_state=RANDOM_STATE)
     Xp = pca.fit_transform(Xc_scaled)
     viz = pd.DataFrame({"pc1": Xp[:,0], "pc2": Xp[:,1], "cluster": labels})
-    st.plotly_chart(px.scatter(viz, x="pc1", y="pc2", color="cluster", title="Cluster Scatter (PCA)"), width="stretch")
+    st.plotly_chart(px.scatter(viz, x="pc1", y="pc2", color="cluster", title="Cluster Scatter (PCA)"), use_container_width=True)
 
     st.markdown("#### Cluster Personas")
     personas = cust.groupby("cluster").agg(
@@ -903,7 +951,7 @@ with tabs[7]:
         avg_distance=("avg_distance","mean"),
         cancel_rate=("cancel_rate","mean")
     ).round(2).reset_index()
-    st.dataframe(personas, width="stretch")
+    st.dataframe(personas, use_container_width=True)
 
     clus_csv = cust[["Customer ID","cluster"] + feat_cols].to_csv(index=False).encode("utf-8")
     st.download_button("Download Clusters (CSV)", clus_csv, "clusters.csv", "text/csv")
@@ -945,12 +993,12 @@ with tabs[7]:
     c3.metric("R²", f"{r2:.3f}")
 
     fig = px.scatter(x=yr_test, y=yhat, labels={"x":"Actual","y":"Predicted"}, title="Predicted vs Actual")
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
     fig_res, ax = plt.subplots()
     ax.hist(yr_test - yhat, bins=40)
     ax.set_title("Residuals")
-    st.pyplot(fig_res)
+    st.pyplot(fig_res, use_container_width=True)
 
     regr_out = df_f.loc[Xr_test.index, ["Booking ID","timestamp","Vehicle Type","Pickup Location","Drop Location","Payment Method"]].copy()
     regr_out["actual_value"] = yr_test.values
@@ -981,7 +1029,7 @@ with tabs[8]:
     risk_df["risk_score"] = scores
     risk_df["is_anomaly"] = (preds == -1).astype(int)
 
-    st.dataframe(risk_df.sort_values("risk_score", ascending=False).head(200), width="stretch")
+    st.dataframe(risk_df.sort_values("risk_score", ascending=False).head(200), use_container_width=True)
     st.download_button("Download Risk Flags (CSV)", risk_df.to_csv(index=False).encode("utf-8"), "risk_flags.csv", "text/csv")
 
 # ---------- Tab 10
@@ -1029,11 +1077,11 @@ with tabs[9]:
         "Baseline": [base_total, base_comp_rate, base_complete, base_arpr, base_rev, base_rating],
         "Scenario": [scen_total, scen_comp_rate, scen_completed, scen_arpr, scen_rev, scen_rating]
     })
-    st.dataframe(compare.style.format({"Baseline": "{:,.2f}", "Scenario": "{:,.2f}"}).hide(axis="index"), width="stretch")
+    st.dataframe(compare.style.format({"Baseline": "{:,.2f}", "Scenario": "{:,.2f}"}).hide(axis="index"), use_container_width=True)
 
     fig = px.bar(compare, x="Metric", y=["Baseline","Scenario"], barmode="group", title="Baseline vs Scenario",
                  color_discrete_sequence=px.colors.qualitative.Set2)
-    st.plotly_chart(fig, width="stretch")
+    st.plotly_chart(fig, use_container_width=True)
 
 # ---------- Tab 11
 with tabs[10]:
