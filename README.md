@@ -1,8 +1,10 @@
+# README.md
+
 # 🚖 Uber India 2024 – NCR Ride Analytics & Decision Lab (Streamlit)
 
 ![status](https://img.shields.io/badge/status-production--ready-green)
-![python](https://img.shields.io/badge/python-3.10%2B-blue)
-![streamlit](https://img.shields.io/badge/streamlit-1.37+-ff4b4b)
+![python](https://img.shields.io/badge/python-3.13-blue)
+![streamlit](https://img.shields.io/badge/streamlit-1.49+-ff4b4b)
 ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
 A consulting-grade, single-file Streamlit application for analyzing a **150,001-row Uber-like bookings dataset (NCR, 2024)**, diagnosing **completion/cancellation** drivers, and running **ML/forecasting/segmentation** with **operational simulations**. Built for speed, clarity, and boardroom-ready visuals.
